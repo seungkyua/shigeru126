@@ -8,14 +8,14 @@ __pycache__/
 htmlcov/
 
 # ---------------------------------------------------------------- 실행할 때마다 새로 생기는 결과 파일
-firstbuy/shigeru_start_*.csv
-buynsell/shigeru_todo_*.csv
+# firstbuy/shigeru_start_*.csv
+# buynsell/shigeru_todo_*.csv
 *.log
 
 # ---------------------------------------------------------------- 개인 매매 기록 (실제 보유 종목·금액)
 # 샘플(buynsell/portfolio_sample.csv)은 관리하고, 내 실제 기록은 올리지 않는다.
 # 내 기록도 버전 관리하려면 아래 줄을 지우세요.
-buynsell/portfolio.csv
+# buynsell/portfolio.csv
 
 # ---------------------------------------------------------------- OS / 에디터
 .DS_Store
