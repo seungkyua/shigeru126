@@ -196,3 +196,53 @@ def test_shouldGuideToPortfolioProgramWithNewPathAfterCandidates():
     rows = st.find_candidates(STOCKS, frames, days=1)
     text = "\n".join(st.format_candidates(rows, amount=None))
     assert "buynsell/portfolio.csv" in text and "python buynsell/shigeru_portfolio.py" in text
+
+
+# ---------------------------------------------------------------- 장중 현재가
+LIVE = {"005930": {"Open": 61_000.0, "High": 62_000.0, "Low": 60_000.0, "Close": 61_500.0,
+                   "time": pd.Timestamp("2026-10-12 11:12")}}
+
+
+def price_frame(dates, close=60_000.0):
+    idx = pd.DatetimeIndex(pd.to_datetime(dates), name="Date")
+    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close}, index=idx)
+
+
+def test_shouldReplaceTodayBarOnlyForStocksWithLiveQuote():
+    frames = {"005930.KS": price_frame(["2026-10-08", "2026-10-12"]),
+              "035720.KQ": price_frame(["2026-10-08", "2026-10-12"])}
+    out = st.apply_live_quotes(frames, LIVE)
+    assert out["005930.KS"]["Close"].iloc[-1] == 61_500
+    assert out["035720.KQ"]["Close"].iloc[-1] == 60_000
+
+
+def test_shouldMarkCandidateWithQuoteTimeWhenLive():
+    frames = {"005930.KS": indicator_frame([True], close=61_500.0),
+              "035720.KQ": indicator_frame([True])}
+    rows = st.find_candidates(STOCKS, frames, days=1, quotes=LIVE)
+    by_name = {r["종목명"]: r for r in rows}
+    assert by_name["삼성전자"]["시세시각"] == pd.Timestamp("2026-10-12 11:12")
+    assert "시세시각" not in by_name["카카오"]
+
+
+def test_shouldShowLivePriceLabelAndWarningWhenLive():
+    frames = {"005930.KS": indicator_frame([True], close=61_500.0)}
+    rows = st.find_candidates(STOCKS, frames, days=1, quotes=LIVE)
+    text = "\n".join(st.format_candidates(rows, amount=None))
+    assert "현재가(장중 11:12) 61,500" in text and "장 마감 전까지" in text
+
+
+def test_shouldKeepClosePriceLabelWhenNotLive():
+    frames = {"005930.KS": indicator_frame([True], close=60_000.0)}
+    text = "\n".join(st.format_candidates(st.find_candidates(STOCKS, frames, days=1), amount=None))
+    assert "종가 60,000" in text and "장중" not in text
+
+
+def test_shouldSaveLivePriceAsCurrentPriceColumn(tmp_path):
+    frames = {"005930.KS": indicator_frame([True], close=61_500.0)}
+    rows = st.find_candidates(STOCKS, frames, days=1, quotes=LIVE)
+    out = tmp_path / "out.csv"
+    st.save_candidates(rows, str(out), amount=None)
+    saved = pd.read_csv(out, encoding="utf-8-sig")
+    assert "현재가" in saved.columns and "종가" not in saved.columns
+    assert saved.loc[0, "시세시각"].startswith("2026-10-12 11:12")

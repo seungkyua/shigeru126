@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from common import shigeru_126 as s
 
@@ -50,8 +51,11 @@ def test_shouldReturnBuySignalWhenRsiDropsBelow30OnLastDay(capsys):
     assert [b[1] for b in result["buys"]] == ["RSI 30 하회 (28.0)"]
 
 
-def test_shouldReturnSellSignalWhenCloudExitOnLastDay(capsys):
-    d = make_frame([{}, {"Close": 80.0}])
+def test_shouldReturnSellSignalWhenCloudExitOnLastDayAfterMacdAndRsiSells(capsys):
+    d = make_frame([{"RSI": 55.0},
+                    {"RSI": 55.0, "MACD": -1.0, "MACD_DC": True},
+                    {"RSI": 45.0},
+                    {"RSI": 45.0, "Close": 80.0}])
     result = s.report("TEST", d, args(since="2026-10-01", held=9))
     assert [x[1] for x in result["sells"]] == ["일목 구름 이탈 → 전량"]
 
@@ -144,7 +148,7 @@ def test_shouldNotShowEmptySeparatorWhenMacdAndRsiAlreadySold():
     pos = s.Position(9)
     pos.units, pos.sold_macd, pos.sold_rsi = 6, True, True
     last = make_frame([{}]).iloc[-1]
-    assert "매도 감시: 구름 이탈선" in s.next_hint(pos, last, "bottom")
+    assert "다음 매도 조건: 구름 이탈선" in s.next_hint(pos, last, "bottom")
 
 
 # ---------------------------------------------------------------- 야후 조회
@@ -162,3 +166,137 @@ def test_shouldFallBackToKosdaqQuietlyWhenKospiHasNoData(monkeypatch):
     monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=fake_download))
     _, sym = s.load_yahoo("043260")
     assert sym == "043260.KQ" and logging.getLogger("yfinance").level == logging.CRITICAL
+
+
+# ---------------------------------------------------------------- 장중 현재가
+def naver_item(code, status="OPEN", close="91,500", open_="88,600", high="92,400", low="86,500",
+               at="2026-10-12T11:12:25.177+09:00"):
+    return {"itemCode": code, "marketStatus": status, "closePrice": close, "openPrice": open_,
+            "highPrice": high, "lowPrice": low, "localTradedAt": at}
+
+
+def daily(dates, close=100.0):
+    idx = pd.DatetimeIndex(pd.to_datetime(dates), name="Date")
+    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close}, index=idx)
+
+
+def test_shouldParseCommaPricesWhenMarketOpen():
+    q = s.parse_live_quotes({"datas": [naver_item("087010")]})["087010"]
+    assert (q["Open"], q["High"], q["Low"], q["Close"]) == (88_600, 92_400, 86_500, 91_500)
+    assert q["time"] == pd.Timestamp("2026-10-12 11:12:25.177")
+
+
+def test_shouldSkipQuoteWhenMarketClosed():
+    assert s.parse_live_quotes({"datas": [naver_item("005930", status="CLOSE")]}) == {}
+
+
+def test_shouldUseCurrentPriceForMissingOpenWhenTradingHalted():
+    q = s.parse_live_quotes({"datas": [naver_item("005930", open_="0", high="0", low="0")]})["005930"]
+    assert (q["Open"], q["High"], q["Low"]) == (91_500, 91_500, 91_500)
+
+
+def test_shouldSkipOnlyItemWithoutPriceAndKeepOthers():
+    payload = {"datas": [naver_item("000001", close="-", open_="-", high="-", low="-"),
+                         naver_item("005930", open_="-")]}
+    quotes = s.parse_live_quotes(payload)
+    assert list(quotes) == ["005930"] and quotes["005930"]["Open"] == 91_500
+
+
+def test_shouldReplaceTodayBarWithLiveQuote():
+    q = s.parse_live_quotes({"datas": [naver_item("087010")]})["087010"]
+    d = s.apply_live_quote(daily(["2026-10-08", "2026-10-12"]), q)
+    assert list(d.index) == [pd.Timestamp("2026-10-08"), pd.Timestamp("2026-10-12")]
+    assert d["Close"].iloc[-1] == 91_500 and d["High"].iloc[-1] == 92_400
+
+
+def test_shouldAppendTodayBarWhenDailyDataLacksToday():
+    q = s.parse_live_quotes({"datas": [naver_item("087010")]})["087010"]
+    d = s.apply_live_quote(daily(["2026-10-07", "2026-10-08"]), q)
+    assert d.index[-1] == pd.Timestamp("2026-10-12") and len(d) == 3 and d["Close"].iloc[-1] == 91_500
+
+
+def test_shouldReturnNoQuotesWhenNetworkFails(monkeypatch):
+    import requests
+
+    def boom(*a, **kw):
+        raise requests.ConnectionError("offline")
+    monkeypatch.setattr(requests, "get", boom)
+    assert s.fetch_live_quotes(["005930"]) == {}
+
+
+def test_shouldRequestOnlyKoreanCodes(monkeypatch):
+    import requests
+    seen = []
+
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"datas": [naver_item("005930")]}
+
+    monkeypatch.setattr(requests, "get", lambda url, **kw: seen.append(url) or Resp())
+    quotes = s.fetch_live_quotes(["005930", "AAPL"])
+    assert list(quotes) == ["005930"] and seen[0].endswith("/005930")
+
+
+def test_shouldNotCallNetworkWhenNoKoreanCodes(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: pytest.fail("호출되면 안 됨"))
+    assert s.fetch_live_quotes(["AAPL"]) == {}
+
+
+def test_shouldLabelPriceAsCloseOrLive():
+    q = s.parse_live_quotes({"datas": [naver_item("087010")]})["087010"]
+    assert s.price_label(None) == "종가"
+    assert s.price_label(q["time"]) == "현재가(장중 11:12)"
+
+
+# ---------------------------------------------------------------- 매도 순서 (MACD → RSI → 구름)
+def full_position():
+    return s.Position(9)
+
+
+def row(**kw):
+    return make_frame([kw]).iloc[-1]
+
+
+def test_shouldNotSellOnCloudExitBeforeMacdDeadCross():
+    pos = full_position()
+    assert s.step(pos, row(Close=80.0, RSI=45.0), "bottom") == []
+    assert pos.units == 9
+
+
+def test_shouldNotSellOnRsiBelow50BeforeMacdDeadCross():
+    pos = full_position()
+    assert s.step(pos, row(RSI=45.0), "bottom") == []
+
+
+def test_shouldNotSellOnCloudExitBeforeRsiSell():
+    pos = full_position()
+    pos.units, pos.sold_macd = 8, True
+    assert s.step(pos, row(Close=80.0, RSI=55.0), "bottom") == []
+    assert pos.units == 8
+
+
+def test_shouldSellAllOnCloudExitAfterMacdAndRsiSells():
+    pos = full_position()
+    pos.units, pos.sold_macd, pos.sold_rsi = 6, True, True
+    assert s.step(pos, row(Close=80.0), "bottom") == [("매도", "일목 구름 이탈 → 전량", 6)]
+    assert pos.stage == 0 and pos.units == 0
+
+
+def test_shouldSellInOrderWhenAllConditionsHitSameDay():
+    pos = full_position()
+    acts = s.step(pos, row(Close=80.0, RSI=45.0, MACD=-1.0, MACD_DC=True), "bottom")
+    assert [(a[1].split(" (")[0], a[2]) for a in acts] == [
+        ("MACD 데드크로스", 1), ("RSI 50 하회", 2), ("일목 구름 이탈 → 전량", 6)]
+
+
+def test_shouldHintMacdDeadCrossFirstInSellStage():
+    hint = s.next_hint(full_position(), row(), "bottom")
+    assert "다음 매도 조건: MACD 데드크로스" in hint and "RSI" not in hint and "구름" not in hint
+
+
+def test_shouldHintRsiAfterMacdSold():
+    pos = full_position()
+    pos.units, pos.sold_macd = 8, True
+    hint = s.next_hint(pos, row(RSI=55.0), "bottom")
+    assert "다음 매도 조건: RSI 50 하회 (현재 55.0)" in hint and "구름" not in hint

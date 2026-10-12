@@ -115,11 +115,19 @@ def test_shouldIgnoreSignalOnOrBeforeLastTradeDate():
     assert pf.pending_actions(d, state, "bottom") == []
 
 
-def test_shouldFindCloudExitWhenFullPosition():
-    state = dict(stage=3, units=9, shares=90, sold_macd=False, sold_rsi=False,
+def test_shouldFindCloudExitWhenMacdAndRsiAlreadySold():
+    state = dict(stage=3, units=6, shares=60, sold_macd=True, sold_rsi=True,
                  last_date=pd.Timestamp("2026-10-01"))
     d = frame([{}, {"Close": 80.0}])
     assert [a[2] for a in pf.pending_actions(d, state, "bottom")] == ["일목 구름 이탈 → 전량"]
+
+
+def test_shouldNotSellRightAfterThirdBuyWhenCloudExitComesFirst():
+    # OCI홀딩스 사례: 6 매수 직후 구름 이탈이 나와도 MACD 데드크로스 전이면 매도하지 않는다
+    state = dict(stage=3, units=9, shares=186, sold_macd=False, sold_rsi=False,
+                 last_date=pd.Timestamp("2026-10-01"))
+    d = frame([{}, {"Close": 80.0, "RSI": 45.0}])
+    assert pf.pending_actions(d, state, "bottom") == []
 
 
 # ---------------------------------------------------------------- 금액/주수
@@ -193,3 +201,46 @@ def test_shouldKeepGivenPathWhenNotFoundAnywhere(tmp_path, monkeypatch):
 def test_shouldSaveTodoFileInBuynsellDirectory():
     todo = [{"기준일": pd.Timestamp("2026-10-08")}]
     assert pf.default_todo_path(todo) == str(Path(pf.__file__).parent / "shigeru_todo_20261008.csv")
+
+
+# ---------------------------------------------------------------- 장중 현재가
+def yahoo_frame(end="2026-10-08", n=120, close=100.0):
+    idx = pd.bdate_range(end=end, periods=n, name="Date")
+    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close}, index=idx)
+
+
+def report_args(**kw):
+    from types import SimpleNamespace
+    return SimpleNamespace(**{"amount": None, "exit": "bottom", **kw})
+
+
+LIVE = {"Open": 120.0, "High": 125.0, "Low": 118.0, "Close": 123.0,
+        "time": pd.Timestamp("2026-10-12 11:12")}
+
+
+def test_shouldUseLivePriceAsTodayWhenMarketOpen(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pf, "load_yahoo", lambda code: (yahoo_frame(), code + ".KS"))
+    trades = trades_from("005930,삼성전자,2026-10-01,매수,1,100,10,9000\n", tmp_path)
+    pf.report("005930", trades, report_args(), quote=LIVE)
+    out = capsys.readouterr().out
+    assert "기준일 2026-10-12" in out and "현재가(장중 11:12) 123.00" in out
+
+
+def test_shouldKeepYahooCloseWhenNoLiveQuote(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pf, "load_yahoo", lambda code: (yahoo_frame(), code + ".KS"))
+    trades = trades_from("005930,삼성전자,2026-10-01,매수,1,100,10,9000\n", tmp_path)
+    pf.report("005930", trades, report_args())
+    out = capsys.readouterr().out
+    assert "기준일 2026-10-08" in out and "종가 100.00" in out and "장중" not in out
+
+
+def test_shouldWarnTodaySignalMayChangeWhenLive(tmp_path, monkeypatch, capsys):
+    # 1/9 보유 + 오늘 장중 급등으로 MACD 골든크로스 → 할 일에 시세시각이 붙고 경고가 나온다
+    raw = yahoo_frame()
+    raw.iloc[-30:, :] = [[100.0 - i] * 4 for i in range(30)]
+    monkeypatch.setattr(pf, "load_yahoo", lambda code: (raw, code + ".KS"))
+    trades = trades_from("005930,삼성전자,2026-10-08,매수,1,71,10,9000\n", tmp_path)
+    todo = pf.report("005930", trades, report_args(), quote={**LIVE, "Close": 90.0, "High": 90.0})
+    out = capsys.readouterr().out
+    assert [a["사유"] for a in todo] == ["MACD 골든크로스"]
+    assert todo[0]["시세시각"] == "2026-10-12 11:12" and "장 마감 전까지" in out

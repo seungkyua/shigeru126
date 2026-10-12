@@ -9,6 +9,7 @@
   - 마지막 매매 이후 1:2:6 신호가 났는지 (놓친 신호 포함)
   - 그래서 지금 얼마를 몇 주 사야 하는지 / 몇 주 팔아야 하는지
 를 알려줍니다.
+장중(09:00~15:30)에 실행하면 마지막 종가 대신 네이버 실시간 현재가로 오늘 봉을 만들어 계산합니다.
 
 CSV 형식 (buynsell/portfolio_sample.csv 참고)
   종목코드,종목명,날짜,구분,단계,가격,수량,투자금
@@ -16,7 +17,7 @@ CSV 형식 (buynsell/portfolio_sample.csv 참고)
 
   구분   : 매수 / 매도
   단계   : 매수 1(RSI 30 하회) 2(MACD 골든크로스) 6(구름 상단 돌파)
-           매도 1(MACD 데드크로스) 2(RSI 50 하회) 6(구름 이탈, 남은 물량 전량)
+           매도 1(MACD 데드크로스) 2(RSI 50 하회) 6(구름 이탈, 남은 물량 전량) — 매도도 이 순서대로
   가격   : 실제 체결 단가,  수량: 실제 체결 주수
   투자금 : 종목당 총 투자금(9단위 전체). 그 종목의 첫 줄에만 적어도 됩니다.
 
@@ -40,8 +41,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common.shigeru_126 import (Position, TOTAL_UNITS, add_indicators, load_yahoo, next_hint,
-                         positive_amount, step)
+from common.shigeru_126 import (Position, TOTAL_UNITS, add_indicators, apply_live_quote,
+                                fetch_live_quotes, load_yahoo, next_hint, positive_amount,
+                                price_label, step)
 
 OUT_DIR = Path(__file__).resolve().parent  # 매매 기록·할 일 목록 모두 buynsell/ 에 둔다
 DEFAULT_CSV = str(OUT_DIR / "portfolio.csv")
@@ -188,15 +190,20 @@ def describe_holding(state: dict, price: float) -> str:
     return line
 
 
-def report(code: str, trades: pd.DataFrame, args) -> list[dict]:
-    """한 종목의 상태와 할 일을 출력하고, 요약용으로 할 일 목록을 돌려준다."""
+def report(code: str, trades: pd.DataFrame, args, quote: dict | None = None) -> list[dict]:
+    """한 종목의 상태와 할 일을 출력하고, 요약용으로 할 일 목록을 돌려준다.
+    quote(장중 실시간 시세)가 있으면 오늘 봉을 그 시세로 바꿔 현재가 기준으로 계산한다."""
     state = build_state(trades, args.amount)
     raw, sym = load_yahoo(code)
+    if quote:
+        raw = apply_live_quote(raw, quote)
+    at = quote["time"] if quote else None
     d = add_indicators(raw)
     last, price = d.iloc[-1], float(d["Close"].iloc[-1])
 
     print("=" * 78)
-    print(f"■ {state['name'] or code}({sym})   기준일 {d.index[-1]:%Y-%m-%d}   종가 {price:,.2f}")
+    print(f"■ {state['name'] or code}({sym})   기준일 {d.index[-1]:%Y-%m-%d}   "
+          f"{price_label(at)} {price:,.2f}")
     print(describe_holding(state, price))
     print(f"  마지막 기록 {state['last_date']:%Y-%m-%d}")
 
@@ -206,11 +213,14 @@ def report(code: str, trades: pd.DataFrame, args) -> list[dict]:
         print("\n".join(format_actions(sized, price)))
         if any(a["날짜"] < d.index[-1] for a in sized):
             print("    ※ 지난 날짜의 신호는 놓친 신호입니다. 지금 가격으로 따라갈지 판단하세요.")
+        if at is not None and any(a["날짜"] == d.index[-1] for a in sized):
+            print("    ※ 오늘 신호는 장중 현재가 기준입니다. 장 마감 전까지 바뀔 수 있습니다.")
     else:
         print("\n  ✅ 지금은 할 일 없음")
         print("  " + next_hint(to_position(state), last, args.exit, state["amount"]))
     print()
-    return [{"종목코드": code, "종목명": state["name"], "기준일": d.index[-1], "현재가": price, **a}
+    live = {"시세시각": f"{at:%Y-%m-%d %H:%M}"} if at is not None else {}
+    return [{"종목코드": code, "종목명": state["name"], "기준일": d.index[-1], "현재가": price, **live, **a}
             for a in sized]
 
 
@@ -236,10 +246,13 @@ def main():
     except ValueError as e:
         sys.exit(f"{args.csv} 오류: {e}")
 
+    quotes = fetch_live_quotes(trades["종목코드"].unique().tolist())
+    if quotes:
+        print(f"  장중: {len(quotes)}개 종목은 실시간 현재가로 오늘 봉을 만들어 계산합니다.\n")
     todo = []
     for code, group in trades.groupby("종목코드", sort=False):
         try:
-            todo += report(code, group, args)
+            todo += report(code, group, args, quotes.get(code))
         except Exception as e:
             print(f"[{code}] 오류: {e}\n")
 

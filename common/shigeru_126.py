@@ -9,10 +9,10 @@
   2단계: MACD가 시그널선을 골든크로스하면       -> 2 매수
   3단계: 종가가 일목균형표 구름 상단을 돌파하면 -> 6 매수
 
-[매도]  (6까지 모두 매수한 '풀포지션' 이후에만 작동)
-  - MACD 데드크로스                     -> 1 매도
-  - RSI(14)가 50 아래로 떨어지면         -> 2 매도
-  - 종가가 구름을 이탈하면               -> 남은 물량 전량 매도
+[매도]  (6까지 모두 매수한 '풀포지션' 이후에만 작동, 순서대로 진행)
+  1단계: MACD 데드크로스                     -> 1 매도
+  2단계: RSI(14)가 50 아래로 떨어지면         -> 2 매도
+  3단계: 종가가 구름을 이탈하면               -> 남은 물량 전량 매도
 
 사용법
   pip install yfinance pandas numpy
@@ -34,6 +34,8 @@ import pandas as pd
 
 UNIT_BUY = {1: 1, 2: 2, 3: 6}
 TOTAL_UNITS = 9
+# 네이버 증권 실시간 시세 (코드를 쉼표로 이어 붙여 여러 종목을 한 번에 조회)
+NAVER_REALTIME = "https://polling.finance.naver.com/api/realtime/domestic/stock/"
 
 
 # ---------------------------------------------------------------- 데이터
@@ -60,6 +62,61 @@ def load_yahoo(code: str, period: str = "3y") -> tuple[pd.DataFrame, str]:
             if len(df) > 0:
                 return df, sym
     raise ValueError(f"'{code}' 데이터를 찾을 수 없습니다.")
+
+
+def _num(text) -> float:
+    """'91,500' → 91500.0. 거래가 없어 '-' 등으로 오면 0."""
+    try:
+        return float(str(text).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def parse_live_quotes(payload: dict) -> dict[str, dict]:
+    """네이버 실시간 시세 응답에서 장이 열려 있는(marketStatus OPEN) 종목만 {종목코드: 오늘 봉}으로.
+    현재가가 없는 종목은 빼고, 시가·고가·저가가 없으면(거래정지 등) 현재가로 채운다."""
+    quotes = {}
+    for x in payload.get("datas", []):
+        if x.get("marketStatus") != "OPEN":
+            continue
+        close = _num(x["closePrice"])
+        if not close:
+            continue
+        bar = {k: _num(x[f"{k.lower()}Price"]) or close for k in ("Open", "High", "Low")}
+        quotes[x["itemCode"]] = {**bar, "Close": close,
+                                 "time": pd.Timestamp(x["localTradedAt"]).tz_localize(None)}
+    return quotes
+
+
+def fetch_live_quotes(codes: list[str], chunk: int = 100) -> dict[str, dict]:
+    """장중이면 한국 6자리 종목의 실시간 시세(지연 없음)를 네이버에서 받는다.
+    장이 닫혀 있거나 조회에 실패한 종목은 빠진다 (그 종목은 야후 일봉 종가를 그대로 쓴다)."""
+    import requests
+
+    codes = [c for c in codes if c.isdigit() and len(c) == 6]
+    quotes = {}
+    for i in range(0, len(codes), chunk):
+        url = NAVER_REALTIME + ",".join(codes[i:i + chunk])
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            r.raise_for_status()
+            quotes.update(parse_live_quotes(r.json()))
+        except Exception as e:
+            print(f"  ⚠️ 장중 현재가 조회 실패 — 야후 일봉 그대로 사용 ({e})", file=sys.stderr)
+    return quotes
+
+
+def apply_live_quote(df: pd.DataFrame, quote: dict) -> pd.DataFrame:
+    """일봉의 오늘 봉을 실시간 시세로 바꾼다 (야후에 오늘 봉이 없으면 새로 붙인다)."""
+    day = quote["time"].normalize()
+    today = pd.DataFrame([{k: quote[k] for k in ("Open", "High", "Low", "Close")}],
+                         index=pd.DatetimeIndex([day], name=df.index.name))
+    return pd.concat([df[df.index < day], today])
+
+
+def price_label(at=None) -> str:
+    """가격 앞에 붙일 이름: 장중 시세 시각(at)이 있으면 '현재가(장중 HH:MM)', 없으면 '종가'."""
+    return f"현재가(장중 {at:%H:%M})" if at is not None else "종가"
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -124,22 +181,27 @@ def step(pos: Position, row, exit_mode: str) -> list[tuple[str, str, int]]:
     """하루치 신호 처리. (구분, 사유, 수량) 리스트 반환"""
     acts = []
 
-    # ----- 매도 (풀포지션 이후에만) -----
+    # ----- 매도 (풀포지션 이후에만, MACD 데드크로스 → RSI 50 하회 → 구름 이탈 순서) -----
+    # 앞 단계 매도가 나오기 전에는 뒷 단계 조건이 맞아도 팔지 않는다.
+    # 같은 날 여러 조건이 맞으면 순서대로 이어서 판다.
     if pos.stage == 3 and pos.units > 0:
-        if cloud_exit(row, exit_mode):
-            acts.append(("매도", "일목 구름 이탈 → 전량", pos.units))
-            pos.reset()
-            return acts
-        if row["MACD_DC"] and not pos.sold_macd:
+        if not pos.sold_macd:
+            if not row["MACD_DC"]:
+                return acts
             q = min(1, pos.units)
             pos.units -= q
             pos.sold_macd = True
             acts.append(("매도", "MACD 데드크로스", q))
-        if row["RSI"] < 50 and not pos.sold_rsi:
+        if not pos.sold_rsi:
+            if not row["RSI"] < 50:
+                return acts
             q = min(2, pos.units)
             pos.units -= q
             pos.sold_rsi = True
             acts.append(("매도", f"RSI 50 하회 ({row['RSI']:.1f})", q))
+        if cloud_exit(row, exit_mode):
+            acts.append(("매도", "일목 구름 이탈 → 전량", pos.units))
+            pos.reset()
         return acts
 
     # ----- 매수 (순서대로) -----
@@ -192,15 +254,16 @@ def next_hint(pos: Position, last, exit_mode: str, amount: float | None = None) 
             money, shares = buy_money(amount, UNIT_BUY[pos.stage + 1], last["Close"])
             hint += f" / 다음 매수 금액 {money:,.0f} (현재가 기준 약 {shares:,}주)"
         return hint
-    lvl = last["CLOUD_BOT"] if exit_mode == "bottom" else last["CLOUD_TOP"]
-    parts = []
+    # 매도는 순서대로 진행하므로 바로 다음 단계 조건만 보여준다
     if not pos.sold_macd:
-        parts.append(f"MACD 데드크로스(차이 {last['MACD'] - last['SIGNAL']:+.3f})")
-    if not pos.sold_rsi:
-        parts.append(f"RSI 50 하회(현재 {last['RSI']:.1f})")
-    parts.append(f"구름 이탈선 {lvl:,.2f} (현재가 {last['Close']:,.2f}, "
-                 f"여유 {(last['Close'] / lvl - 1) * 100:+.1f}%)")
-    return f"{pos.units}/9 보유 — 매도 감시: " + " / ".join(parts)
+        cond = f"MACD 데드크로스 (MACD-시그널 {last['MACD'] - last['SIGNAL']:+.3f})"
+    elif not pos.sold_rsi:
+        cond = f"RSI 50 하회 (현재 {last['RSI']:.1f})"
+    else:
+        lvl = last["CLOUD_BOT"] if exit_mode == "bottom" else last["CLOUD_TOP"]
+        cond = (f"구름 이탈선 {lvl:,.2f} 하회 (현재가 {last['Close']:,.2f}, "
+                f"여유 {(last['Close'] / lvl - 1) * 100:+.1f}%)")
+    return f"{pos.units}/9 보유 — 다음 매도 조건: {cond}"
 
 
 def format_today(buys: list, sells: list, amount: float | None = None,

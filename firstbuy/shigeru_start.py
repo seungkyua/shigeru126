@@ -7,6 +7,7 @@
 stock/stock_list_krx.csv 의 KOSPI/KOSDAQ 종목(일반주·우선주, ETF/ETN 제외)을 훑어서,
 1:2:6 매매법의 1단계 매수 조건(RSI(14)가 30 아래로 내려감)이 발생한 종목을 알려줍니다.
 --amount 로 종목당 투자금을 넣으면 첫 1/9 매수 금액과 살 수 있는 주수를 함께 보여줍니다.
+장중(09:00~15:30)에 실행하면 마지막 종가 대신 네이버 실시간 현재가로 오늘 봉을 만들어 계산합니다.
 기본으로 주가 5,000원 미만 종목은 제외하며(--min-price 로 변경),
 찾은 종목은 화면 출력과 함께 firstbuy/shigeru_start_YYYYMMDD.csv 로 저장합니다(--out 으로 변경).
 
@@ -34,7 +35,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common.shigeru_126 import add_indicators, buy_money, positive_amount, UNIT_BUY
+from common.shigeru_126 import (add_indicators, apply_live_quote, buy_money, fetch_live_quotes,
+                                positive_amount, price_label, UNIT_BUY)
 
 SUFFIX = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
 PRICE_COLS = ["Open", "High", "Low", "Close"]
@@ -108,6 +110,12 @@ def download_all(symbols: list[str], chunk: int = 100, period: str = "1y") -> di
     return frames
 
 
+def apply_live_quotes(frames: dict[str, pd.DataFrame], quotes: dict[str, dict]) -> dict[str, pd.DataFrame]:
+    """장중 시세가 있는 종목은 일봉의 오늘 봉을 실시간 현재가로 바꾼다 (심볼 005930.KS → 코드 005930)."""
+    return {sym: apply_live_quote(df, quotes[sym.split(".")[0]]) if sym.split(".")[0] in quotes else df
+            for sym, df in frames.items()}
+
+
 # ---------------------------------------------------------------- 신호
 def start_signal_date(d: pd.DataFrame, days: int = 1):
     """최근 days 거래일 안에 RSI가 30 아래로 내려간 날(가장 최근)을 돌려준다. 없으면 None."""
@@ -122,9 +130,11 @@ def first_buy(amount: float, price: float) -> tuple[float, int]:
 
 
 def find_candidates(stocks: pd.DataFrame, frames: dict[str, pd.DataFrame],
-                    days: int = 1, min_price: float = 0) -> list[dict]:
+                    days: int = 1, min_price: float = 0, quotes: dict | None = None) -> list[dict]:
     """지표가 계산된 frames에서 매수 시작 신호가 난 종목을 모아 RSI 낮은 순으로 정렬.
-    마지막 종가가 min_price 미만인 저가주는 뺀다."""
+    마지막 가격(장중이면 현재가)이 min_price 미만인 저가주는 뺀다.
+    quotes(장중 시세)가 있는 종목은 '시세시각'을 붙여 현재가 기준임을 표시한다."""
+    quotes = quotes or {}
     rows = []
     for s in stocks.itertuples(index=False):
         sym = yahoo_symbol(s.종목코드, s.시장)
@@ -137,9 +147,12 @@ def find_candidates(stocks: pd.DataFrame, frames: dict[str, pd.DataFrame],
         last = d.iloc[-1]
         if last["Close"] < min_price:
             continue
-        rows.append({"종목코드": s.종목코드, "종목명": s.종목명, "시장": s.시장,
-                     "신호일": date, "기준일": d.index[-1],
-                     "종가": float(last["Close"]), "RSI": round(float(last["RSI"]), 1)})
+        row = {"종목코드": s.종목코드, "종목명": s.종목명, "시장": s.시장,
+               "신호일": date, "기준일": d.index[-1],
+               "종가": float(last["Close"]), "RSI": round(float(last["RSI"]), 1)}
+        if s.종목코드 in quotes:
+            row["시세시각"] = quotes[s.종목코드]["time"].floor("min")
+        rows.append(row)
     return sorted(rows, key=lambda r: r["RSI"])
 
 
@@ -162,6 +175,9 @@ def format_candidates(rows: list[dict], amount: float | None, min_price: float =
         return ["매수 시작 종목이 없습니다. (--days 로 기간을 늘려 보세요)"]
 
     lines = ["=" * 78, f"  🟢 1:2:6 매수 시작 종목 {len(rows)}개  (RSI 30 하회 → 1/9 매수)"]
+    live = [r["시세시각"] for r in rows if "시세시각" in r]
+    if live:
+        lines.append(f"  ⏱ 장중 현재가({max(live):%H:%M}) 기준 — 장 마감 전까지 신호가 바뀔 수 있습니다")
     if min_price:
         lines.append(f"  주가 {min_price:,.0f}원 미만 제외")
     if amount:
@@ -170,7 +186,8 @@ def format_candidates(rows: list[dict], amount: float | None, min_price: float =
     lines.append("=" * 78)
     for i, r in enumerate(rows, 1):
         line = (f"{i:>3}. {r['종목명']}({r['종목코드']}, {r['시장']})  "
-                f"신호일 {r['신호일']:%Y-%m-%d}  종가 {r['종가']:,.0f}  RSI {r['RSI']:.1f}")
+                f"신호일 {r['신호일']:%Y-%m-%d}  {price_label(r.get('시세시각'))} {r['종가']:,.0f}  "
+                f"RSI {r['RSI']:.1f}")
         if amount:
             money, shares = first_buy(amount, r["종가"])
             line += (f"\n       → {money:,.0f} 매수 (약 {shares:,}주)" if shares
@@ -194,6 +211,8 @@ def save_candidates(rows: list[dict], path: str, amount: float | None) -> None:
         buys = [first_buy(amount, p) for p in df["종가"]]
         df["1단계금액"] = [round(m) for m, _ in buys]
         df["주수"] = [n for _, n in buys]
+    if "시세시각" in df.columns:  # 장중에 받은 결과는 종가가 아니라 현재가
+        df = df.rename(columns={"종가": "현재가"})
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
@@ -231,13 +250,16 @@ def main():
     stocks = filter_stocks(stocks, args.market, args.limit, stock_only=not args.include_etf)
     print(f"  {len(stocks)}개 종목 검사 시작", file=sys.stderr)
     symbols = [yahoo_symbol(c, m) for c, m in zip(stocks["종목코드"], stocks["시장"])]
-    frames = compute_indicators(download_all(symbols))
+    quotes = fetch_live_quotes(stocks["종목코드"].tolist())
+    if quotes:
+        print(f"  장중: {len(quotes)}개 종목은 실시간 현재가로 오늘 봉을 만들어 계산", file=sys.stderr)
+    frames = compute_indicators(apply_live_quotes(download_all(symbols), quotes))
     missing = len(symbols) - len(frames)
     print(f"  데이터 확보 {len(frames)}/{len(symbols)}개 종목"
           + (f" (야후에 없거나 기간이 짧은 {missing}개 제외)" if missing else "") + "\n",
           file=sys.stderr)
 
-    rows = find_candidates(stocks, frames, args.days, args.min_price)
+    rows = find_candidates(stocks, frames, args.days, args.min_price, quotes)
     print("\n".join(format_candidates(rows, args.amount, args.min_price)))
     if rows:  # 찾은 종목이 있으면 항상 파일로도 남긴다
         out = args.out or default_out_path(rows)
